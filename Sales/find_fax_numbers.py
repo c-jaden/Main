@@ -1,431 +1,302 @@
-#!/usr/bin/env python3
 """
-Find fax numbers on a list of websites.
+Scrape fax numbers from a list of school/district websites.
 
-Upgrades:
-- Extracts numbers from tel: links (common in site footers)
-- Adds "Find Us" heuristic: if a Find Us/address block has 2 numbers, assume 2nd is fax
-- Still prioritizes explicit "Fax:" labeling and schema.org JSON-LD fax fields
-
-Usage:
-  python find_fax_numbers.py --input sites.txt --output fax_results.csv
-  python find_fax_numbers.py --sites https://example.com https://example.org
-
-Dependencies:
-  pip install requests beautifulsoup4 lxml
+- Reads:  WA School Websites.csv (column: WEBSITE)
+- Writes: wa_school_fax_numbers.csv
+- Shows:  live progress bar in VS Code terminal (tqdm)
+- Logs:   running counts + last site processed
 """
 
-from __future__ import annotations
-
-import argparse
-import csv
-import json
 import re
 import time
-from dataclasses import dataclass
-from typing import Optional, List, Tuple
-from urllib.parse import urljoin, urlparse, unquote
+from urllib.parse import urljoin, urlparse
 
+import pandas as pd
 import requests
 from bs4 import BeautifulSoup
+from tqdm import tqdm
 
 
-# ----------------------------
-# Config
-# ----------------------------
+INPUT_CSV = "WA School Websites.csv"          # <-- your file
+INPUT_COL = "WEBSITE"                         # <-- column name in your file
+OUTPUT_CSV = "wa_school_fax_numbers.csv"
 
-DEFAULT_PATH_HINTS = [
-    "/contact",
-    "/contact-us",
-    "/contacts",
-    "/about",
-    "/about-us",
-    "/support",
-    "/help",
-    "/customer-service",
-    "/locations",
-    "/district",
-    "/our-district",
-]
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; FaxFinder/1.1; +https://example.com/bot)"
-}
-
-PHONE_CANDIDATE_RE = re.compile(
-    r"""
-    (?:
-        (?:\+?\d{1,3}[\s\-.()]*)?          # optional country code
-        (?:\(?\d{2,4}\)?[\s\-.()]*)       # area code
-        \d{2,4}[\s\-.()]*\d{3,4}          # local number
-        (?:\s*(?:x|ext\.?)\s*\d{1,6})?    # optional extension
-    )
-    """,
-    re.VERBOSE | re.IGNORECASE,
+# --- Fax detection regexes (covers "Fax:", "F:", and common phone formatting) ---
+FAX_LABEL_RE = re.compile(r"\b(fax|facsimile)\b", re.IGNORECASE)
+PHONE_RE = re.compile(
+    r"(?:(?:\+?1\s*[-\.\(]?\s*)?)"           # optional +1 / 1
+    r"(?:\(\s*\d{3}\s*\)|\d{3})"             # area code
+    r"\s*[-\.]?\s*"
+    r"\d{3}"
+    r"\s*[-\.]?\s*"
+    r"\d{4}"
 )
 
-FAX_KEYWORDS_RE = re.compile(r"\bfax\b|\bfaks\b|\btélécop(ieur|ie)\b", re.IGNORECASE)
+# Pages on school sites where fax numbers often live
+KEYWORD_LINK_RE = re.compile(
+    r"(contact|directory|staff|about|administration|office|communications|district|school\s*board)",
+    re.IGNORECASE
+)
 
-# "Find us" patterns (common in school CMS footers)
-FIND_US_RE = re.compile(r"\bfind us\b|\bvisit us\b|\bcontact us\b|\blocation\b|\baddress\b", re.IGNORECASE)
-
-SCHEMA_FAX_KEYS = {"faxNumber", "fax", "fax_number", "faxnumber"}
-
-
-@dataclass
-class FaxHit:
-    fax: str
-    score: float
-    page_url: str
-    context: str
-
-
-# ----------------------------
-# Helpers
-# ----------------------------
-
-def normalize_url(u: str) -> str:
-    u = u.strip()
-    if not u:
-        return u
-    if not re.match(r"^https?://", u, re.IGNORECASE):
-        u = "https://" + u
-    return u
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0 Safari/537.36"
+    )
+}
 
 
-def same_domain(base: str, target: str) -> bool:
-    b = urlparse(base).netloc.lower()
-    t = urlparse(target).netloc.lower()
-    return b == t or t.endswith("." + b)
+def normalize_url(url: str) -> str:
+    url = str(url).strip()
+    if not url:
+        return ""
+    if not url.startswith(("http://", "https://")):
+        url = "http://" + url
+    return url
 
 
-def clean_phone(raw: str) -> str:
-    raw = raw.strip()
-    raw = re.sub(r"\s+", " ", raw)
-    return raw
-
-
-def digits_only(s: str) -> str:
-    return re.sub(r"\D", "", s)
-
-
-def get_text_and_soup(html: str) -> Tuple[str, BeautifulSoup]:
-    soup = BeautifulSoup(html, "lxml")
-    for tag in soup(["script", "style", "noscript"]):
-        tag.decompose()
-    text = soup.get_text(" ", strip=True)
-    return text, soup
-
-
-def fetch(session: requests.Session, url: str, timeout: int = 20) -> Optional[str]:
+def same_domain(a: str, b: str) -> bool:
     try:
-        r = session.get(url, headers=HEADERS, timeout=timeout, allow_redirects=True)
-        if r.status_code >= 400:
-            return None
-        r.encoding = r.apparent_encoding or r.encoding
-        return r.text
-    except requests.RequestException:
-        return None
+        return urlparse(a).netloc.lower().replace("www.", "") == urlparse(b).netloc.lower().replace("www.", "")
+    except Exception:
+        return False
 
 
-def extract_schema_fax(soup: BeautifulSoup) -> List[str]:
-    results: List[str] = []
-    for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
-        try:
-            data = json.loads(script.string or "")
-        except Exception:
-            continue
-
-        def walk(obj):
-            if isinstance(obj, dict):
-                for k, v in obj.items():
-                    if str(k) in SCHEMA_FAX_KEYS and isinstance(v, str):
-                        results.append(clean_phone(v))
-                    walk(v)
-            elif isinstance(obj, list):
-                for it in obj:
-                    walk(it)
-
-        walk(data)
-
-    # dedupe
-    seen = set()
-    out = []
-    for x in results:
-        if x not in seen:
-            seen.add(x)
-            out.append(x)
-    return out
+def fetch_html(url: str, timeout=20) -> str:
+    r = requests.get(url, headers=HEADERS, timeout=timeout, allow_redirects=True)
+    r.raise_for_status()
+    ct = (r.headers.get("Content-Type") or "").lower()
+    # Some servers omit content-type; treat empty as potentially HTML and let parsing handle it.
+    if ct and ("text/html" not in ct and "application/xhtml+xml" not in ct):
+        return ""
+    return r.text
 
 
-def find_contact_like_links(base_url: str, soup: BeautifulSoup, max_links: int = 8) -> List[str]:
+def extract_faxes_from_text(text: str):
+    """
+    Returns list of dicts: {"fax": "...", "context": "..."}
+    Strategy:
+      - find phone-like numbers
+      - prefer ones near "fax" labels
+      - if the page mentions fax at all, accept phone numbers (lower bar) since formatting varies
+    """
+    if not text:
+        return []
+
+    collapsed = re.sub(r"\s+", " ", text)
+
     candidates = []
+    for m in PHONE_RE.finditer(collapsed):
+        num = m.group(0).strip()
+
+        # context window around the number
+        start = max(0, m.start() - 40)
+        end = min(len(collapsed), m.end() + 40)
+        context = collapsed[start:end]
+
+        score = 1
+        if FAX_LABEL_RE.search(context):
+            score += 10
+
+        wide_start = max(0, m.start() - 120)
+        wide_end = min(len(collapsed), m.end() + 120)
+        if FAX_LABEL_RE.search(collapsed[wide_start:wide_end]):
+            score += 5
+
+        candidates.append((score, num, context))
+
+    candidates.sort(reverse=True, key=lambda x: x[0])
+
+    seen = set()
+    results = []
+    page_mentions_fax = bool(FAX_LABEL_RE.search(collapsed))
+
+    for score, num, context in candidates:
+        key = re.sub(r"\D", "", num)
+        if len(key) < 10:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+
+        # Strong accept if "fax" label nearby OR page mentions fax somewhere
+        if score >= 11 or page_mentions_fax:
+            results.append({"fax": num, "context": context.strip()})
+
+    return results
+
+
+def extract_title(soup: BeautifulSoup) -> str:
+    if soup.title and soup.title.string:
+        return soup.title.string.strip()
+    h1 = soup.find("h1")
+    if h1 and h1.get_text(strip=True):
+        return h1.get_text(strip=True)
+    return ""
+
+
+def get_candidate_links(base_url: str, soup: BeautifulSoup, limit=6):
+    links = []
     for a in soup.find_all("a", href=True):
         href = a["href"].strip()
-        if href.startswith(("mailto:", "tel:", "javascript:")):
-            continue
-        abs_url = urljoin(base_url, href)
-        if not abs_url.lower().startswith(("http://", "https://")):
-            continue
-        if not same_domain(base_url, abs_url):
+        text = a.get_text(" ", strip=True)
+
+        if not href or href.startswith(("mailto:", "tel:", "javascript:")):
             continue
 
-        text = (a.get_text(" ", strip=True) or "").lower()
-        href_l = abs_url.lower()
-        if any(k in text for k in ["contact", "support", "locations", "about", "district"]) or any(
-            k in href_l for k in ["contact", "support", "location", "about", "help", "district"]
-        ):
-            candidates.append(abs_url)
+        full = urljoin(base_url, href)
+        if not same_domain(base_url, full):
+            continue
 
+        if KEYWORD_LINK_RE.search(href) or KEYWORD_LINK_RE.search(text):
+            links.append(full)
+
+    # de-dupe while preserving order
+    deduped = []
     seen = set()
-    out = []
-    for u in candidates:
+    for u in links:
         if u not in seen:
             seen.add(u)
-            out.append(u)
-        if len(out) >= max_links:
-            break
-    return out
+            deduped.append(u)
+
+    return deduped[:limit]
 
 
-def extract_tel_links(soup: BeautifulSoup) -> List[str]:
-    """Extract numbers from <a href="tel:..."> links."""
-    nums: List[str] = []
-    for a in soup.find_all("a", href=True):
-        href = a["href"].strip()
-        if not href.lower().startswith("tel:"):
-            continue
-        val = href[4:]
-        val = unquote(val)
-        # strip params like tel:+1...;ext=123
-        val = val.split(";")[0].split("?")[0]
-        val = val.strip()
-        if val:
-            nums.append(clean_phone(val))
-
-    # dedupe
-    seen = set()
-    out = []
-    for n in nums:
-        if n not in seen:
-            seen.add(n)
-            out.append(n)
-    return out
-
-
-def score_fax_candidates(text: str, page_url: str) -> List[FaxHit]:
-    hits: List[FaxHit] = []
-
-    # 1) Explicit "Fax: <number>" (highest confidence)
-    explicit_re = re.compile(
-        r"(fax[^0-9]{0,15})(" + PHONE_CANDIDATE_RE.pattern + r")",
-        re.IGNORECASE | re.VERBOSE,
-    )
-    for m in explicit_re.finditer(text):
-        context = text[max(0, m.start() - 60): m.end() + 60]
-        fax = clean_phone(m.group(2))
-        if len(digits_only(fax)) >= 7:
-            hits.append(FaxHit(fax=fax, score=95.0, page_url=page_url, context=context))
-
-    # 2) Generic candidates scored by proximity to "fax"
-    keywords = [m.start() for m in FAX_KEYWORDS_RE.finditer(text)]
-    for m in PHONE_CANDIDATE_RE.finditer(text):
-        fax = clean_phone(m.group(0))
-        if len(digits_only(fax)) < 7:
-            continue
-
-        score = 10.0
-        if keywords:
-            d = min(abs(m.start() - k) for k in keywords)
-            if d <= 10:
-                score = 90.0
-            elif d <= 30:
-                score = 70.0
-            elif d <= 80:
-                score = 45.0
-            elif d <= 150:
-                score = 25.0
-
-        snippet = text[max(0, m.start() - 40): m.end() + 40]
-        if FAX_KEYWORDS_RE.search(snippet):
-            score = max(score, 80.0)
-
-        if score >= 25.0:
-            hits.append(FaxHit(fax=fax, score=score, page_url=page_url, context=snippet))
-
-    # Deduplicate by fax value
-    best: dict[str, FaxHit] = {}
-    for h in hits:
-        if h.fax not in best or h.score > best[h.fax].score:
-            best[h.fax] = h
-
-    return sorted(best.values(), key=lambda x: x.score, reverse=True)
-
-
-def find_findus_block_fax(text: str, page_url: str) -> Optional[FaxHit]:
+def process_site(url: str, sleep_s=0.5):
     """
-    Heuristic:
-    - Find a window of text around "Find Us"/address-like keywords
-    - If the window contains >= 2 phone-like numbers and none are explicitly labeled "fax",
-      assume the SECOND number is the fax.
+    Returns: (site_title, uniq_faxes, sources, errors)
+      - uniq_faxes: list of {"fax": str, "context": str}
+      - sources: list[str] pages where fax was found
+      - errors: list[str]
     """
-    # If "fax" appears anywhere, don’t apply this heuristic (we already have better logic)
-    if FAX_KEYWORDS_RE.search(text):
-        return None
+    errors = []
+    found = []
+    sources = []
 
-    m = FIND_US_RE.search(text)
-    if not m:
-        return None
+    url = normalize_url(url)
+    if not url:
+        return "", [], [], ["Empty URL"]
 
-    # Grab a window around the match (footer blocks often get flattened into one line)
-    start = max(0, m.start() - 250)
-    end = min(len(text), m.end() + 400)
-    window = text[start:end]
+    # Try homepage
+    try:
+        html = fetch_html(url)
+        if not html:
+            errors.append("Non-HTML or empty content at homepage")
+            return "", [], [], errors
 
-    nums = [clean_phone(x.group(0)) for x in PHONE_CANDIDATE_RE.finditer(window)]
-    # Filter to plausible numbers
-    nums = [n for n in nums if len(digits_only(n)) >= 7]
+        soup = BeautifulSoup(html, "html.parser")
+        title = extract_title(soup)
 
-    if len(nums) >= 2:
-        fax = nums[1]
-        return FaxHit(
-            fax=fax,
-            score=55.0,  # medium confidence (heuristic)
-            page_url=page_url,
-            context=f'Find-Us heuristic window: "{window[:200]}..."',
-        )
+        text = soup.get_text(" ", strip=True)
+        faxes = extract_faxes_from_text(text)
+        if faxes:
+            found.extend(faxes)
+            sources.append(url)
 
-    return None
+        # Crawl likely pages
+        candidate_links = get_candidate_links(url, soup, limit=6)
 
+        # Add common paths (many school CMS systems support these)
+        for path in ["/contact", "/contact-us", "/contactus", "/directory", "/staff", "/about"]:
+            candidate_links.append(urljoin(url, path))
 
-def choose_best(hits: List[FaxHit]) -> Optional[FaxHit]:
-    return hits[0] if hits else None
+        # De-dupe
+        seen = set()
+        final_links = []
+        for l in candidate_links:
+            if l not in seen:
+                seen.add(l)
+                final_links.append(l)
 
-
-def scan_page_for_fax(page_url: str, html: str) -> List[FaxHit]:
-    text, soup = get_text_and_soup(html)
-    hits: List[FaxHit] = []
-
-    # Schema fax (very high confidence)
-    for f in extract_schema_fax(soup):
-        if len(digits_only(f)) >= 7:
-            hits.append(FaxHit(fax=f, score=98.0, page_url=page_url, context="schema.org JSON-LD"))
-
-    # tel: links (often contain the same numbers shown visually)
-    for n in extract_tel_links(soup):
-        # Score tel links modestly; if fax is explicit nearby, the text scoring will win anyway
-        if len(digits_only(n)) >= 7:
-            hits.append(FaxHit(fax=n, score=20.0, page_url=page_url, context="tel: link"))
-
-    # Normal text scoring
-    hits.extend(score_fax_candidates(text, page_url=page_url))
-
-    # Find-us heuristic
-    heuristic_hit = find_findus_block_fax(text, page_url=page_url)
-    if heuristic_hit:
-        hits.append(heuristic_hit)
-
-    # Deduplicate, keep best per number
-    best: dict[str, FaxHit] = {}
-    for h in hits:
-        if h.fax not in best or h.score > best[h.fax].score:
-            best[h.fax] = h
-
-    return sorted(best.values(), key=lambda x: x.score, reverse=True)
-
-
-def scan_site_for_fax(site: str, sleep_s: float = 0.25) -> Tuple[Optional[FaxHit], List[FaxHit]]:
-    site = normalize_url(site)
-    session = requests.Session()
-
-    html = fetch(session, site)
-    if not html:
-        return None, []
-
-    text, soup = get_text_and_soup(html)
-
-    all_hits: List[FaxHit] = []
-    all_hits.extend(scan_page_for_fax(site, html))
-
-    # Crawl likely pages
-    urls_to_try = [urljoin(site, p) for p in DEFAULT_PATH_HINTS]
-    urls_to_try += find_contact_like_links(site, soup, max_links=8)
-
-    seen = {site}
-    for u in urls_to_try:
-        if u in seen:
-            continue
-        seen.add(u)
-        time.sleep(sleep_s)
-        sub_html = fetch(session, u)
-        if not sub_html:
-            continue
-        all_hits.extend(scan_page_for_fax(u, sub_html))
-
-    all_hits = sorted(all_hits, key=lambda x: x.score, reverse=True)
-    best = choose_best(all_hits)
-    return best, all_hits
-
-
-# ----------------------------
-# CLI
-# ----------------------------
-
-def read_sites_from_file(path: str) -> List[str]:
-    out = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            s = line.strip()
-            if not s or s.startswith("#"):
+        # Visit up to 10 candidate pages
+        for link in final_links[:10]:
+            try:
+                time.sleep(sleep_s)
+                html2 = fetch_html(link)
+                if not html2:
+                    continue
+                soup2 = BeautifulSoup(html2, "html.parser")
+                text2 = soup2.get_text(" ", strip=True)
+                faxes2 = extract_faxes_from_text(text2)
+                if faxes2:
+                    found.extend(faxes2)
+                    sources.append(link)
+            except Exception as e:
+                errors.append(f"Error fetching {link}: {type(e).__name__}")
                 continue
-            out.append(s)
-    return out
+
+        # Final de-dupe fax list
+        uniq = []
+        seen_nums = set()
+        for item in found:
+            key = re.sub(r"\D", "", item["fax"])
+            if key not in seen_nums:
+                seen_nums.add(key)
+                uniq.append(item)
+
+        return title, uniq, sources, errors
+
+    except Exception as e:
+        errors.append(f"Homepage error: {type(e).__name__}: {e}")
+        return "", [], [], errors
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--input", help="Text file with one site per line")
-    ap.add_argument("--sites", nargs="*", help="Sites passed directly on CLI")
-    ap.add_argument("--output", default="fax_results.csv", help="Output CSV path")
-    ap.add_argument("--sleep", type=float, default=0.25, help="Delay between page requests (seconds)")
-    args = ap.parse_args()
+    df = pd.read_csv(INPUT_CSV)
+    if INPUT_COL not in df.columns:
+        raise ValueError(f"Column '{INPUT_COL}' not found. Found columns: {list(df.columns)}")
 
-    sites: List[str] = []
-    if args.input:
-        sites.extend(read_sites_from_file(args.input))
-    if args.sites:
-        sites.extend(args.sites)
-
-    if not sites:
-        raise SystemExit("Provide --input sites.txt or --sites ...")
+    urls = df[INPUT_COL].astype(str).tolist()
+    total = len(urls)
 
     rows = []
-    for site in sites:
-        best, all_hits = scan_site_for_fax(site, sleep_s=args.sleep)
-        if best:
-            rows.append({
-                "site": site,
-                "fax": best.fax,
-                "confidence": round(best.score, 1),
-                "source_url": best.page_url,
-                "context": (best.context or "")[:200],
-            })
+    found_count = 0
+    not_found_count = 0
+    error_count = 0
+
+    pbar = tqdm(urls, total=total, desc="Processing Schools", unit="site")
+    for i, raw_url in enumerate(pbar, start=1):
+        url = normalize_url(raw_url)
+
+        # update what VS Code terminal shows "right now"
+        pbar.set_postfix_str(urlparse(url).netloc[:40] if url else "empty-url")
+
+        title, faxes, sources, errors = process_site(url)
+
+        if faxes:
+            fax_join = "; ".join([f["fax"] for f in faxes])
+            found_count += 1
         else:
-            rows.append({
-                "site": site,
-                "fax": "",
-                "confidence": 0,
-                "source_url": "",
-                "context": "No fax found",
-            })
+            fax_join = "Not found"
+            not_found_count += 1
 
-    with open(args.output, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=["site", "fax", "confidence", "source_url", "context"])
-        w.writeheader()
-        w.writerows(rows)
+        if errors:
+            error_count += 1
 
-    print(f"Wrote {len(rows)} rows to {args.output}")
+        rows.append({
+            "website": url,
+            "site_title": title,
+            "fax_numbers": fax_join,
+            "found_on": "; ".join(sources) if sources else "",
+            "errors": "; ".join(errors) if errors else ""
+        })
+
+        # occasional detailed log lines that don't break tqdm
+        if i % 25 == 0 or i == total:
+            tqdm.write(
+                f"[{i}/{total}] Found: {found_count} | Not found: {not_found_count} | Sites w/ errors: {error_count}"
+            )
+
+    out = pd.DataFrame(rows)
+    out.to_csv(OUTPUT_CSV, index=False)
+    print(f"\nDone. Wrote: {OUTPUT_CSV}")
 
 
 if __name__ == "__main__":
+    """
+    Run:
+      pip install pandas requests beautifulsoup4 tqdm
+      python scrape_faxes.py
+    """
     main()
