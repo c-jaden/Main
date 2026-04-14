@@ -807,6 +807,13 @@ _LOWERCASE_WORDS = {
     "nor", "of", "on", "or", "so", "the", "to", "up", "yet",
 }
 
+# Short all-caps strings that should be kept uppercase (true abbreviations)
+_KEEP_UPPER = {
+    "II", "III", "IV", "VI", "VII", "VIII", "IX",   # Roman numerals
+    "PK", "TK", "KG",                                # Grade abbreviations
+    "STEM", "STEAM", "JROTC", "ROTC",                # Program names
+}
+
 def _smart_titlecase(s: str) -> str:
     """Convert a string to title case with common English rules."""
     if not s or not s.strip():
@@ -815,9 +822,9 @@ def _smart_titlecase(s: str) -> str:
     result = []
     for i, word in enumerate(words):
         clean = word.strip(".,;:-()")
-        # Preserve all-caps abbreviations of 2-3 chars (e.g. "IB", "STEM" handled below)
-        if clean.isupper() and len(clean) <= 3 and clean.isalpha():
-            result.append(word)
+        # Preserve known uppercase abbreviations
+        if clean.upper() in _KEEP_UPPER:
+            result.append(clean.upper())
             continue
         # Always capitalize first and last word
         if i == 0 or i == len(words) - 1:
