@@ -31,7 +31,7 @@ except Exception as e:
 print(f"\nWatching inbox for new files. Press Ctrl+C to stop.\n")
 INBOX.mkdir(exist_ok=True)
 observer = Observer()
-observer.schedule(InboxHandler(), str(INBOX), recursive=False)
+observer.schedule(InboxHandler(), str(INBOX), recursive=True)
 observer.start()
 
 try:

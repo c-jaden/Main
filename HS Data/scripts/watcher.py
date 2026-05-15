@@ -113,7 +113,7 @@ if __name__ == "__main__":
     threading.Thread(target=_retry_worker, daemon=True).start()
 
     observer = Observer()
-    observer.schedule(InboxHandler(), str(INBOX), recursive=False)
+    observer.schedule(InboxHandler(), str(INBOX), recursive=True)
     observer.start()
 
     try:
