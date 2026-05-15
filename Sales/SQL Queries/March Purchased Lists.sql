@@ -16,8 +16,8 @@ WITH best_fuzzy AS (
                 LOWER(TRIM(p."Full School Name")), LOWER(TRIM(n.name))
             ) DESC
         ) as rn
-    FROM principal_leads_march_2026 p
-    CROSS JOIN nces_public_private_school n
+    FROM uploads_202603.principal_leads_march_2026 p
+    CROSS JOIN nces.nces_public_private_school n
     WHERE n.state_abbr = p."Location State"
       AND jaro_winkler_similarity(
             LOWER(TRIM(p."Full School Name")), LOWER(TRIM(n.name))
@@ -40,14 +40,14 @@ SELECT "First Name" as "First Name"
     ,'Lead' as "Contact Type"
     ,coalesce(n1.district_id, n2.district_id, bf.district_id) as "NCES District ID"
     ,coalesce(n1.nces_id, n2.nces_id, bf.nces_id) as "NCES School ID"
-FROM principal_leads_march_2026 p
-LEFT JOIN nces_public_private_school n1
+FROM uploads_202603.principal_leads_march_2026 p
+LEFT JOIN nces.nces_public_private_school n1
     ON LOWER(TRIM(p."Full School Name")) = LOWER(TRIM(n1.name))
     AND p."Location State" = n1.state_abbr
     AND p."Location Zip" = n1.zip
 LEFT JOIN (
     SELECT DISTINCT ON (name, state_abbr) *
-    FROM nces_public_private_school
+    FROM nces.nces_public_private_school
     ORDER BY name, state_abbr, nces_id
 ) n2 ON n1.nces_id IS NULL
      AND LOWER(TRIM(p."Full School Name")) = LOWER(TRIM(n2.name))
@@ -138,9 +138,13 @@ SELECT
     ,dd.name as "District"
     ,'Lead' as "Contact Type"
     ,"District Id" as "NCES District ID"
-FROM district_leads_march_2026 dl
-left join districts_dioceses dd
+FROM uploads_202603.district_leads_march_2026 dl
+left join nces.districts_dioceses dd
     on dl."District Id" = dd.district_id
+    -- and dl."Location State" = dd.state_abbr
+
+where dl."First Name" = 'Bethany'
+and dl."Last Name" = 'Henry' 
 
 ;
 
